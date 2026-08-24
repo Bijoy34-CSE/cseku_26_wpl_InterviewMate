@@ -7,7 +7,7 @@ InterviewMate is a free, AI-powered web application that helps students and job 
 | | |
 |---|---|
 | **Version** | 1.0 |
-| **Project Phase** | Week 1 |
+| **Project Phase** | Week 2 |
 | **Target Users** | Students, job seekers, interview and viva candidates |
 | **Primary Platform** | Web Application |
 
