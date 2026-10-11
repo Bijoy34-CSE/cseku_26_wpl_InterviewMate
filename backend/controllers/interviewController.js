@@ -4,20 +4,28 @@ const Question = require('../models/Question');
 const Answer = require('../models/Answer');
 const Score = require('../models/Score');
 const Feedback = require('../models/Feedback');
+const PracticeAttempt = require('../models/PracticeAttempt');
 const aiService = require('../services/aiService');
 const adaptiveEngine = require('../services/adaptiveEngine');
 const documentService = require('../services/documentService');
+const policy = require('../services/interviewPolicy');
 const mediaAnalysisService = require('../services/mediaAnalysisService');
+const { reserveInterview, releaseInterview, hasActivePremium, planStatus } = require('../services/planService');
 const { InsufficientDocumentError, AiUnavailableError } = require('../services/aiErrors');
+const { EMPTY_METRICS } = mediaAnalysisService;
 const {
   serializeSession,
   serializeQuestion,
   serializeScore,
   serializeFeedback,
+  serializePracticeAttempt,
   finalizeSession,
 } = require('../services/sessionService');
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+const NOAI_MESSAGE =
+  'No AI provider is available. Please make sure Gemini is configured or Ollama is running locally.';
 
 // Loads a session and verifies it belongs to req.user. Sends a response and
 // returns null if it doesn't exist / doesn't belong to the user, so callers
@@ -38,53 +46,118 @@ async function loadOwnedSession(req, res) {
   return session;
 }
 
+// Shared error mapping so every AI-backed endpoint reports failures the same way.
+function sendAiError(res, error) {
+  if (error instanceof InsufficientDocumentError) {
+    return res.status(422).json({ message: error.message, code: 'INSUFFICIENT_DOCUMENT' });
+  }
+  if (error instanceof AiUnavailableError) {
+    return res.status(error.status || 503).json({ message: error.message, code: 'AI_UNAVAILABLE', retryable: true });
+  }
+  return res.status(500).json({ message: error.message });
+}
+
+// Builds the real interview history (question, answer, evaluation) the
+// adaptive engine and both AI providers use to choose the next question.
+async function buildInterviewContext(sessionId) {
+  const [questions, answers, scores] = await Promise.all([
+    Question.find({ session: sessionId }).sort({ index: 1 }),
+    Answer.find({ session: sessionId }),
+    Score.find({ session: sessionId }),
+  ]);
+  const answerByQ = new Map(answers.map((a) => [String(a.question), a]));
+  const scoreByQ = new Map(scores.map((sc) => [String(sc.question), sc]));
+
+  const previousContext = questions
+    .filter((q) => scoreByQ.has(String(q._id)))
+    .map((q) => {
+      const sc = scoreByQ.get(String(q._id));
+      return {
+        question: q.text,
+        answer: answerByQ.get(String(q._id))?.text || '',
+        score: sc.overall,
+        difficulty: q.difficulty,
+        feedback: sc.aiFeedback || '',
+        strengths: sc.strengths || [],
+        weaknesses: sc.weaknesses || [],
+        missingPoints: sc.missingPoints || [],
+        performanceImpact: sc.performanceImpact || 'neutral',
+      };
+    });
+
+  return { askedTexts: questions.map((q) => q.text), previousContext };
+}
+
+function remainingSecondsFor(session) {
+  return session.deadlineAt ? Math.max(0, Math.round((session.deadlineAt.getTime() - Date.now()) / 1000)) : null;
+}
+
+// Generates (or returns the already-generated) question at `index`. Safe to
+// call again after a failure: it never creates a duplicate.
+async function ensureQuestionAt(session, index, difficulty, adaptivePlan) {
+  const existing = await Question.findOne({ session: session._id, index });
+  if (existing) return existing;
+
+  const { askedTexts, previousContext } = await buildInterviewContext(session._id);
+  const category = aiService.resolveCategoryBucket(session.type);
+
+  const generated = await aiService.generateQuestion({
+    category,
+    difficulty,
+    purpose: session.purpose,
+    purposeKey: session.purposeKey || session.purpose,
+    type: session.type,
+    level: session.level,
+    duration: session.durationLabel,
+    mode: session.mode,
+    materials: session.materials,
+    questionNumber: index + 1,
+    totalQuestions: session.totalQuestions,
+    remainingSeconds: remainingSecondsFor(session),
+    adaptivePlan,
+    askedTexts,
+    previousContext,
+    documentText: session.documentText,
+    documentParts: session.documentParts || [],
+  });
+
+  return Question.create({
+    session: session._id,
+    index,
+    text: generated.text,
+    category,
+    difficulty,
+    source: generated.source,
+  });
+}
+
 // POST /api/interview/sessions
 exports.createSession = async (req, res) => {
+  let session = null;
+  let reservedUser = null;
   try {
     if (!aiService.isRealAiConfigured()) {
-      return res.status(503).json({
-        message:
-          'AI evaluation is not configured on this server, so a real document-grounded interview cannot be generated. ' +
-          'Set GEMINI_API_KEY in backend/.env and restart the server.',
-      });
+      return res.status(503).json({ message: NOAI_MESSAGE });
     }
 
-    const { purpose, customPurpose, type, difficulty, level, duration, questions, mode, materials } = req.body;
-
-    if (!purpose || !type || !difficulty || !questions) {
-      return res.status(400).json({ message: 'purpose, type, difficulty and questions are required' });
+    const parsed = policy.parseSetup(req.body);
+    if (parsed.error) {
+      return res.status(400).json({ message: parsed.error });
     }
-
-    if (!adaptiveEngine.DIFFICULTIES.includes(difficulty)) {
-      return res.status(400).json({ message: `difficulty must be one of: ${adaptiveEngine.DIFFICULTIES.join(', ')}` });
-    }
-
-    const totalQuestions = parseInt(questions, 10);
-    if (!totalQuestions || totalQuestions < 1) {
-      return res.status(400).json({ message: 'questions must resolve to a positive number' });
-    }
+    const setup = parsed.value;
 
     // The Mock Interview is strictly document-grounded: every question must
-    // come from the candidate's own uploaded material, never generic/model
-    // knowledge - so a document is mandatory, not optional context.
+    // come from the candidate's own uploaded material.
     if (!req.file) {
       return res.status(400).json({
         message: 'A document (PDF, DOCX, or PPTX) is required to start this interview - questions are generated strictly from its content.',
       });
     }
 
-    const resolvedPurpose = customPurpose && customPurpose.trim() ? customPurpose.trim() : purpose;
-
-    // Extract the uploaded document's content now so the AI provider can
-    // ground every generated question in it.
     let documentText = null;
     let documentParts = [];
-    let resolvedMaterials = materials || null;
-
     try {
       documentText = await documentService.extractText(req.file);
-      // PDFs are forwarded to Gemini as-is (diagrams/charts/tables and all);
-      // DOCX/PPTX contribute their embedded images individually.
       documentParts = await documentService.buildDocumentParts(req.file);
 
       if (!documentText && documentParts.length === 0) {
@@ -92,77 +165,68 @@ exports.createSession = async (req, res) => {
           message: 'No readable text or images could be extracted from the uploaded file. Please try a different document.',
         });
       }
-
-      resolvedMaterials = req.file.originalname;
     } catch (extractError) {
       return res.status(400).json({ message: extractError.message });
     }
 
-    // Parse "15 Mins" -> 15. Falls back to no deadline if unparseable, so a
-    // session is never accidentally created already-expired.
-    const durationMatch = String(duration || '').match(/\d+/);
-    const durationMinutes = durationMatch ? parseInt(durationMatch[0], 10) : null;
-    const startedAt = new Date();
-    const deadlineAt = durationMinutes ? new Date(startedAt.getTime() + durationMinutes * 60 * 1000) : null;
+    reservedUser = await reserveInterview(req.user._id);
+    if (!reservedUser) {
+      const currentUser = await mongoose.model('User').findById(req.user._id);
+      if (!currentUser) return res.status(401).json({ message: 'Account not found' });
+      return res.status(402).json({
+        message: 'You have used all 3 free interview sessions for this month. Upgrade to Premium to continue.',
+        code: 'FREE_LIMIT_REACHED',
+        plan: planStatus(currentUser),
+      });
+    }
 
-    const session = await InterviewSession.create({
+    const startedAt = new Date();
+    const deadlineAt = new Date(startedAt.getTime() + setup.durationMinutes * 60 * 1000);
+
+    session = await InterviewSession.create({
       user: req.user._id,
-      purpose: resolvedPurpose,
-      type,
-      difficulty,
-      level,
-      durationLabel: duration,
-      durationMinutes,
+      purpose: setup.resolvedPurpose,
+      purposeKey: setup.purpose,
+      type: setup.type,
+      difficulty: setup.difficulty,
+      adaptiveDifficulty: setup.adaptiveDifficulty,
+      initialDifficulty: setup.difficulty,
+      level: setup.level,
+      durationLabel: setup.durationLabel,
+      durationMinutes: setup.durationMinutes,
       startedAt,
       deadlineAt,
-      mode,
-      materials: resolvedMaterials,
+      mode: setup.mode,
+      materials: req.file.originalname,
       documentText,
       documentParts,
-      totalQuestions,
+      totalQuestions: setup.totalQuestions,
       currentQuestionIndex: 0,
       status: 'in_progress',
     });
 
-    const category = aiService.resolveCategoryBucket(type);
-    const generated = await aiService.generateQuestion({
-      category,
-      difficulty,
-      purpose: resolvedPurpose,
-      type,
-      level,
-      duration,
-      mode,
-      materials: resolvedMaterials,
-      questionNumber: 1,
-      totalQuestions,
-      askedTexts: [],
-      previousContext: [],
-      documentText,
-      documentParts,
-    });
-
-    const question = await Question.create({
-      session: session._id,
-      index: 0,
-      text: generated.text,
-      category,
-      difficulty,
-      source: generated.source,
-    });
+    const question = await ensureQuestionAt(session, 0, setup.difficulty, null);
 
     res.status(201).json({
       session: serializeSession(session),
       question: serializeQuestion(question),
+      plan: planStatus(reservedUser),
     });
   } catch (error) {
-    if (error instanceof InsufficientDocumentError) {
-      return res.status(422).json({ message: error.message });
+    // Never leave a half-created interview behind when the first question
+    // could not be generated - the user simply starts again.
+    if (session) {
+      await Promise.all([
+        Question.deleteMany({ session: session._id }),
+        InterviewSession.deleteOne({ _id: session._id }),
+      ]).catch(() => {});
     }
-    if (error instanceof AiUnavailableError) {
-      return res.status(503).json({ message: error.message });
+    if (reservedUser) {
+      await releaseInterview(req.user._id, hasActivePremium(reservedUser)).catch((releaseError) => {
+        console.error('[quota] could not release failed interview reservation:', releaseError.message);
+      });
     }
-    res.status(500).json({ message: error.message });
+    sendAiError(res, error);
   }
 };
 
@@ -173,13 +237,21 @@ exports.getSession = async (req, res) => {
     if (!session) return;
 
     let currentQuestion = null;
+    let pendingAnswer = null;
     if (session.status === 'in_progress') {
       currentQuestion = await Question.findOne({ session: session._id, index: session.currentQuestionIndex });
+      // An answer already saved for the current question means the previous
+      // submit stopped partway (e.g. AI unavailable) - the client resumes it.
+      if (currentQuestion) {
+        const saved = await Answer.findOne({ question: currentQuestion._id });
+        pendingAnswer = saved ? saved.text : null;
+      }
     }
 
     res.status(200).json({
       session: serializeSession(session),
       currentQuestion: currentQuestion ? serializeQuestion(currentQuestion) : null,
+      pendingAnswer,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -202,6 +274,8 @@ exports.listSessions = async (req, res) => {
       const feedback = feedbackBySession.get(String(session._id));
       serialized.overallScore = feedback ? feedback.overallScore : null;
       serialized.categoryScores = feedback ? feedback.categoryScores : null;
+      serialized.answeredQuestions = feedback ? feedback.answeredQuestions ?? null : null;
+      serialized.missedQuestions = feedback ? feedback.missedQuestions ?? 0 : null;
       return serialized;
     });
 
@@ -212,12 +286,17 @@ exports.listSessions = async (req, res) => {
 };
 
 // POST /api/interview/sessions/:id/answers
+//
+// Resume-safe: the answer, its evaluation and the next question are each
+// saved as soon as they exist. If the AI is unavailable partway (for example
+// Gemini AND Ollama both fail while generating the next question), the
+// request returns a retryable error and re-submitting the same question
+// continues from exactly where it stopped - nothing is lost or duplicated,
+// and the interview, settings, answers and timer are untouched.
 exports.submitAnswer = async (req, res) => {
   try {
     if (!aiService.isRealAiConfigured()) {
-      return res.status(503).json({
-        message: 'AI evaluation is not configured on this server. Set GEMINI_API_KEY in backend/.env and restart the server.',
-      });
+      return res.status(503).json({ message: NOAI_MESSAGE });
     }
 
     const session = await loadOwnedSession(req, res);
@@ -227,9 +306,7 @@ exports.submitAnswer = async (req, res) => {
       return res.status(400).json({ message: 'This interview session has already been completed' });
     }
 
-    // Authoritative server-side deadline check - the frontend's countdown is
-    // just a display and is never trusted for enforcement. Time already up
-    // means this answer is rejected and the session is finalized as timed out.
+    // Authoritative server-side deadline: once time is up, no more answers.
     if (session.deadlineAt && Date.now() > session.deadlineAt.getTime()) {
       const feedback = await finalizeSession(session, { timedOut: true });
       return res.status(200).json({
@@ -240,7 +317,7 @@ exports.submitAnswer = async (req, res) => {
       });
     }
 
-    const { questionId, text, responseDurationSeconds } = req.body;
+    const { questionId, text, responseDurationSeconds, clientSignals } = req.body;
     if (!questionId || typeof text !== 'string') {
       return res.status(400).json({ message: 'questionId and text are required' });
     }
@@ -256,69 +333,81 @@ exports.submitAnswer = async (req, res) => {
       return res.status(400).json({ message: 'This is not the current question for this session' });
     }
 
-    const existingAnswer = await Answer.findOne({ question: question._id });
-    if (existingAnswer) {
-      return res.status(400).json({ message: 'This question has already been answered' });
+    // ---- 1. Answer (kept if a later step fails) ----
+    let answer = await Answer.findOne({ question: question._id });
+    if (!answer) {
+      const trimmedText = text.trim();
+      if (!trimmedText) {
+        return res.status(400).json({ message: 'Please provide an answer before submitting.' });
+      }
+
+      const durationSeconds =
+        typeof responseDurationSeconds === 'number' && responseDurationSeconds > 0 ? responseDurationSeconds : null;
+      const spoken = /audio|video/i.test(session.mode || '') && durationSeconds !== null;
+      const mediaMetrics = spoken
+        ? mediaAnalysisService.analyzeSpokenAnswer(trimmedText, durationSeconds, clientSignals)
+        : { ...EMPTY_METRICS };
+
+      answer = await Answer.create({
+        session: session._id,
+        question: question._id,
+        text: trimmedText,
+        wordCount: trimmedText.split(/\s+/).length,
+        responseDurationSeconds: durationSeconds,
+        inputMethod: spoken ? 'spoken' : 'typed',
+        mediaMetrics,
+      });
     }
 
-    const trimmedText = text.trim();
-    const wordCount = trimmedText ? trimmedText.split(/\s+/).length : 0;
+    // ---- 2. Evaluation (kept if the next step fails) ----
+    let score = await Score.findOne({ question: question._id });
+    if (!score) {
+      const spoken = answer.inputMethod === 'spoken';
+      const scored = await aiService.scoreAnswer({
+        questionText: question.text,
+        answerText: answer.text,
+        category: question.category,
+        difficulty: question.difficulty,
+        purpose: session.purpose,
+        type: session.type,
+        level: session.level,
+        mode: session.mode,
+        answerWasSpoken: spoken,
+        documentText: session.documentText,
+        documentParts: session.documentParts || [],
+        mediaMetrics: { ...(answer.mediaMetrics?.toObject?.() || answer.mediaMetrics || {}), responseDurationSeconds: answer.responseDurationSeconds },
+      });
 
-    // Only genuinely measurable signals - see mediaAnalysisService.js for
-    // exactly what is (and deliberately is not) derived here.
-    const durationSeconds = typeof responseDurationSeconds === 'number' && responseDurationSeconds > 0 ? responseDurationSeconds : null;
-    const mediaMetrics = mediaAnalysisService.analyzeSpokenAnswer(trimmedText, durationSeconds);
+      score = await Score.create({
+        session: session._id,
+        question: question._id,
+        answer: answer._id,
+        technicalAccuracy: scored.technicalAccuracy,
+        structuralFlow: scored.structuralFlow,
+        communication: scored.communication,
+        confidence: scored.confidence,
+        relevance: scored.relevance,
+        overall: scored.overall,
+        correctness: scored.correctness ?? null,
+        completeness: scored.completeness ?? null,
+        aiFeedback: scored.aiFeedback,
+        suggestedAnswer: scored.suggestedAnswer,
+        strengths: scored.strengths || [],
+        weaknesses: scored.weaknesses || [],
+        missingPoints: scored.missingPoints || [],
+        improvementSuggestions: scored.improvementSuggestions || [],
+        evidenceFromDocument: scored.evidenceFromDocument || [],
+        performanceImpact: scored.performanceImpact || 'neutral',
+        source: scored.source,
+      });
+    }
 
-    const answer = await Answer.create({
-      session: session._id,
-      question: question._id,
-      text: trimmedText,
-      wordCount,
-      responseDurationSeconds: durationSeconds,
-      mediaMetrics,
-    });
+    const nextIndex = question.index + 1;
 
-    const sessionDocumentParts = session.documentParts || [];
-
-    const scored = await aiService.scoreAnswer({
-      questionText: question.text,
-      answerText: trimmedText,
-      category: question.category,
-      difficulty: question.difficulty,
-      level: session.level,
-      mode: session.mode,
-      documentText: session.documentText,
-      documentParts: sessionDocumentParts,
-      mediaMetrics,
-    });
-
-    const score = await Score.create({
-      session: session._id,
-      question: question._id,
-      answer: answer._id,
-      technicalAccuracy: scored.technicalAccuracy,
-      structuralFlow: scored.structuralFlow,
-      communication: scored.communication,
-      confidence: scored.confidence,
-      relevance: scored.relevance,
-      overall: scored.overall,
-      correctness: scored.correctness ?? null,
-      completeness: scored.completeness ?? null,
-      aiFeedback: scored.aiFeedback,
-      suggestedAnswer: scored.suggestedAnswer,
-      strengths: scored.strengths || [],
-      weaknesses: scored.weaknesses || [],
-      missingPoints: scored.missingPoints || [],
-      improvementSuggestions: scored.improvementSuggestions || [],
-      evidenceFromDocument: scored.evidenceFromDocument || [],
-      performanceImpact: scored.performanceImpact || 'neutral',
-      source: scored.source,
-    });
-
-    session.currentQuestionIndex += 1;
-
-    // Session finished
-    if (session.currentQuestionIndex >= session.totalQuestions) {
+    // ---- 3. Finished: last question answered ----
+    if (nextIndex >= session.totalQuestions) {
+      session.currentQuestionIndex = nextIndex;
+      await session.save();
       const feedback = await finalizeSession(session);
       return res.status(200).json({
         completed: true,
@@ -328,71 +417,102 @@ exports.submitAnswer = async (req, res) => {
       });
     }
 
-    // Otherwise, generate the next (adaptive) question
-    const nextDifficulty = adaptiveEngine.nextDifficulty(question.difficulty, score.overall);
-    session.difficulty = nextDifficulty;
+    // ---- 4. Time ran out while the answer was being evaluated ----
+    // The answer that was already submitted in time counts; the remaining
+    // questions are never asked and are recorded as missed.
+    if (session.deadlineAt && Date.now() > session.deadlineAt.getTime()) {
+      session.currentQuestionIndex = nextIndex;
+      await session.save();
+      const feedback = await finalizeSession(session, { timedOut: true });
+      return res.status(200).json({
+        completed: true,
+        timedOut: true,
+        score: serializeScore(score),
+        session: serializeSession(session),
+        feedback: serializeFeedback(feedback),
+      });
+    }
+
+    // ---- 5. Adaptive next question ----
+    const plan = session.adaptiveDifficulty
+      ? adaptiveEngine.buildPlan({
+          currentDifficulty: question.difficulty,
+          lastEvaluation: score,
+          remainingQuestions: session.totalQuestions - nextIndex,
+        })
+      : null;
+    const nextDifficulty = plan ? plan.difficulty : question.difficulty;
+
+    const nextQuestion = await ensureQuestionAt(session, nextIndex, nextDifficulty, plan);
+
+    session.currentQuestionIndex = nextIndex;
+    session.difficulty = nextQuestion.difficulty;
     await session.save();
-
-    const askedTexts = (await Question.find({ session: session._id }).select('text')).map((q) => q.text);
-    const category = aiService.resolveCategoryBucket(session.type);
-
-    // Build the real interview context (question, answer, score, feedback) so
-    // the next question adapts to how this candidate has actually performed.
-    const priorQuestions = await Question.find({ session: session._id }).sort({ index: 1 });
-    const priorAnswers = await Answer.find({ session: session._id });
-    const priorScores = await Score.find({ session: session._id });
-    const answerByQuestion = new Map(priorAnswers.map((a) => [String(a.question), a]));
-    const scoreByQuestion = new Map(priorScores.map((s) => [String(s.question), s]));
-
-    const previousContext = priorQuestions
-      .filter((q) => scoreByQuestion.has(String(q._id)))
-      .map((q) => ({
-        question: q.text,
-        answer: answerByQuestion.get(String(q._id))?.text || '',
-        score: scoreByQuestion.get(String(q._id))?.overall ?? null,
-        feedback: scoreByQuestion.get(String(q._id))?.aiFeedback || '',
-      }));
-
-    const generated = await aiService.generateQuestion({
-      category,
-      difficulty: nextDifficulty,
-      purpose: session.purpose,
-      type: session.type,
-      level: session.level,
-      duration: session.durationLabel,
-      mode: session.mode,
-      materials: session.materials,
-      questionNumber: session.currentQuestionIndex + 1,
-      totalQuestions: session.totalQuestions,
-      askedTexts,
-      previousContext,
-      documentText: session.documentText,
-      documentParts: sessionDocumentParts,
-    });
-
-    const nextQuestion = await Question.create({
-      session: session._id,
-      index: session.currentQuestionIndex,
-      text: generated.text,
-      category,
-      difficulty: nextDifficulty,
-      source: generated.source,
-    });
 
     res.status(200).json({
       completed: false,
       score: serializeScore(score),
+      adaptive: plan ? { direction: plan.direction, from: question.difficulty, to: nextQuestion.difficulty } : null,
       session: serializeSession(session),
       nextQuestion: serializeQuestion(nextQuestion),
     });
   } catch (error) {
-    if (error instanceof InsufficientDocumentError) {
-      return res.status(422).json({ message: error.message });
+    sendAiError(res, error);
+  }
+};
+
+// POST /api/interview/sessions/:id/skip
+// Skips the current question without an Answer or Score. It stays recorded as
+// skipped (a missed question) in the final evaluation. Resume-safe like submit.
+exports.skipQuestion = async (req, res) => {
+  try {
+    if (!aiService.isRealAiConfigured()) {
+      return res.status(503).json({ message: NOAI_MESSAGE });
     }
-    if (error instanceof AiUnavailableError) {
-      return res.status(503).json({ message: error.message });
+    const session = await loadOwnedSession(req, res);
+    if (!session) return;
+
+    if (session.status !== 'in_progress') {
+      return res.status(400).json({ message: 'This interview session has already been completed' });
     }
-    res.status(500).json({ message: error.message });
+    if (session.deadlineAt && Date.now() > session.deadlineAt.getTime()) {
+      const feedback = await finalizeSession(session, { timedOut: true });
+      return res.status(200).json({ completed: true, timedOut: true, session: serializeSession(session), feedback: serializeFeedback(feedback) });
+    }
+
+    const question = await Question.findOne({ session: session._id, index: session.currentQuestionIndex });
+    if (!question) return res.status(404).json({ message: 'Current question not found for this session' });
+    if (await Answer.findOne({ question: question._id })) {
+      return res.status(400).json({ message: 'This question has already been answered' });
+    }
+
+    if (!question.skippedAt) {
+      question.skippedAt = new Date();
+      await question.save();
+    }
+
+    const nextIndex = question.index + 1;
+    if (nextIndex >= session.totalQuestions) {
+      session.currentQuestionIndex = nextIndex;
+      await session.save();
+      const feedback = await finalizeSession(session);
+      return res.status(200).json({ completed: true, skipped: true, session: serializeSession(session), feedback: serializeFeedback(feedback) });
+    }
+
+    // No evaluation exists for a skipped question, so difficulty is unchanged.
+    const nextQuestion = await ensureQuestionAt(session, nextIndex, session.difficulty, null);
+    session.currentQuestionIndex = nextIndex;
+    await session.save();
+
+    res.status(200).json({
+      completed: false,
+      skipped: true,
+      adaptive: null,
+      session: serializeSession(session),
+      nextQuestion: serializeQuestion(nextQuestion),
+    });
+  } catch (error) {
+    sendAiError(res, error);
   }
 };
 
@@ -408,6 +528,154 @@ exports.completeSession = async (req, res) => {
       session: serializeSession(session),
       feedback: serializeFeedback(feedback),
     });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// POST /api/interview/sessions/:id/questions/:questionId/practice-again
+// Re-attempts a single question from a completed interview: same question,
+// a fresh answer, scored through the exact same Gemini flow as the original
+// interview (strictly document-grounded, not a generic re-grade). Stores the
+// attempt separately from the original Answer/Score (which stay untouched)
+// and returns a previous-vs-new comparison. Never generates a new/unrelated
+// question and never uses the fallback provider.
+exports.practiceAgain = async (req, res) => {
+  try {
+    if (!aiService.isRealAiConfigured()) {
+      return res.status(503).json({
+        message: NOAI_MESSAGE,
+      });
+    }
+
+    const session = await loadOwnedSession(req, res);
+    if (!session) return;
+
+    if (session.status !== 'completed') {
+      return res.status(400).json({ message: 'Practice Again is available once this interview session is completed' });
+    }
+
+    const { questionId } = req.params;
+    const { text } = req.body;
+
+    if (!isValidId(questionId)) {
+      return res.status(400).json({ message: 'Invalid questionId' });
+    }
+    if (typeof text !== 'string' || !text.trim()) {
+      return res.status(400).json({ message: 'text is required' });
+    }
+
+    const question = await Question.findById(questionId);
+    if (!question || String(question.session) !== String(session._id)) {
+      return res.status(404).json({ message: 'Question not found for this session' });
+    }
+
+    // Baseline to compare against: the most recent practice attempt for this
+    // question if one exists, otherwise the original interview Score.
+    const [originalScore, lastAttempt] = await Promise.all([
+      Score.findOne({ question: question._id }),
+      PracticeAttempt.findOne({ question: question._id }).sort({ createdAt: -1 }),
+    ]);
+    if (!originalScore) {
+      return res.status(400).json({ message: 'This question was not answered in the interview, so there is no previous score to compare against.' });
+    }
+    const previousOverall = lastAttempt ? lastAttempt.overall : originalScore.overall;
+
+    const trimmedText = text.trim();
+    const wordCount = trimmedText.split(/\s+/).length;
+
+    // Practice Again is typed, so no audio/video signals apply. Same question,
+    // same document, same evaluation pipeline (Gemini, then Ollama on failure).
+    const scored = await aiService.scorePracticeAnswer({
+      questionText: question.text,
+      answerText: trimmedText,
+      category: question.category,
+      difficulty: question.difficulty,
+      purpose: session.purpose,
+      type: session.type,
+      level: session.level,
+      mode: 'Text Response',
+      answerWasSpoken: false,
+      documentText: session.documentText,
+      documentParts: session.documentParts || [],
+      mediaMetrics: { ...EMPTY_METRICS },
+    });
+
+    const attempt = await PracticeAttempt.create({
+      user: req.user._id,
+      session: session._id,
+      question: question._id,
+      text: trimmedText,
+      wordCount,
+      technicalAccuracy: scored.technicalAccuracy,
+      structuralFlow: scored.structuralFlow,
+      communication: scored.communication,
+      confidence: scored.confidence,
+      relevance: scored.relevance,
+      overall: scored.overall,
+      correctness: scored.correctness ?? null,
+      completeness: scored.completeness ?? null,
+      aiFeedback: scored.aiFeedback,
+      suggestedAnswer: scored.suggestedAnswer,
+      strengths: scored.strengths || [],
+      weaknesses: scored.weaknesses || [],
+      missingPoints: scored.missingPoints || [],
+      improvementSuggestions: scored.improvementSuggestions || [],
+      previousOverall,
+      source: scored.source,
+    });
+
+    res.status(201).json({
+      question: serializeQuestion(question),
+      previousScore: previousOverall,
+      originalScore: originalScore.overall,
+      attempt: serializePracticeAttempt(attempt),
+      improved: attempt.overall > previousOverall,
+      delta: attempt.overall - previousOverall,
+    });
+  } catch (error) {
+    sendAiError(res, error);
+  }
+};
+
+exports.deleteSession = async (req, res, next) => {
+  try {
+    const session = await loadOwnedSession(req, res);
+    if (!session) return;
+    await Promise.all([
+      Question.deleteMany({ session: session._id }),
+      Answer.deleteMany({ session: session._id }),
+      Score.deleteMany({ session: session._id }),
+      Feedback.deleteMany({ session: session._id }),
+      PracticeAttempt.deleteMany({ session: session._id, user: req.user._id }),
+      InterviewSession.deleteOne({ _id: session._id, user: req.user._id }),
+    ]);
+    return res.json({ message: 'Interview session and its associated records were deleted' });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// GET /api/interview/sessions/:id/questions/:questionId/practice-attempts
+// Lists every Practice Again attempt made for a single history question,
+// newest first - strictly scoped to the authenticated user's own session.
+exports.listPracticeAttempts = async (req, res) => {
+  try {
+    const session = await loadOwnedSession(req, res);
+    if (!session) return;
+
+    const { questionId } = req.params;
+    if (!isValidId(questionId)) {
+      return res.status(400).json({ message: 'Invalid questionId' });
+    }
+
+    const question = await Question.findById(questionId);
+    if (!question || String(question.session) !== String(session._id)) {
+      return res.status(404).json({ message: 'Question not found for this session' });
+    }
+
+    const attempts = await PracticeAttempt.find({ question: question._id }).sort({ createdAt: -1 });
+    res.status(200).json({ attempts: attempts.map(serializePracticeAttempt) });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

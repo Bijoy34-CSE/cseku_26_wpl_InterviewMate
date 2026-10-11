@@ -98,4 +98,63 @@ async function sendVerificationEmail(to, code, minutesValid) {
   });
 }
 
-module.exports = { isConfigured, missingVars, sendVerificationEmail, verificationTemplate };
+async function sendEmailChangeVerificationEmail(to, code, minutesValid) {
+  if (!isConfigured()) {
+    throw new Error(
+      `Email service is not configured. Missing environment variable(s): ${missingVars().join(', ')}`
+    );
+  }
+
+  const text = [
+    'InterviewMate - Confirm your new email address',
+    '',
+    `Your verification code: ${code}`,
+    '',
+    `This code expires in ${minutesValid} minutes and can only be used once.`,
+    "If you didn't request this change, you can safely ignore this email.",
+  ].join('\n');
+  const html = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:24px auto;padding:24px;border:1px solid #e2e8f0;border-radius:16px;color:#0f172a"><h1 style="font-size:20px">Confirm your new email address</h1><p>Enter this code in InterviewMate to finish changing your email:</p><p style="font-size:30px;font-weight:bold;letter-spacing:8px;color:#5846F6">${code}</p><p>This code expires in ${minutesValid} minutes and can only be used once.</p><p>If you didn't request this change, you can safely ignore this email.</p></div>`;
+
+  await getTransporter().sendMail({
+    from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
+    to,
+    subject: 'Confirm your InterviewMate email change',
+    text,
+    html,
+  });
+}
+
+async function sendPasswordResetEmail(to, code, minutesValid) {
+  if (!isConfigured()) {
+    throw new Error(
+      `Email service is not configured. Missing environment variable(s): ${missingVars().join(', ')}`
+    );
+  }
+
+  const text = [
+    'InterviewMate - Password reset',
+    '',
+    `Your password reset code: ${code}`,
+    '',
+    `This code expires in ${minutesValid} minutes and can only be used once.`,
+    "If you didn't request this, you can safely ignore this email.",
+  ].join('\n');
+  const html = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:24px auto;padding:24px;border:1px solid #e2e8f0;border-radius:16px;color:#0f172a"><h1 style="font-size:20px">Reset your password</h1><p>Enter this code in InterviewMate to choose a new password:</p><p style="font-size:30px;font-weight:bold;letter-spacing:8px;color:#5846F6">${code}</p><p>This code expires in ${minutesValid} minutes and can only be used once.</p><p>If you didn't request this, you can safely ignore this email.</p></div>`;
+
+  await getTransporter().sendMail({
+    from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
+    to,
+    subject: 'Your InterviewMate password reset code',
+    text,
+    html,
+  });
+}
+
+module.exports = {
+  isConfigured,
+  missingVars,
+  sendVerificationEmail,
+  sendEmailChangeVerificationEmail,
+  sendPasswordResetEmail,
+  verificationTemplate,
+};

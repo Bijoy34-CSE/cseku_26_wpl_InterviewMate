@@ -19,9 +19,12 @@ class InsufficientDocumentError extends Error {
 // is reserved for Practice only (see services/aiProviders/fallbackProvider.js).
 // interviewController catches this and returns a clear retry-able error.
 class AiUnavailableError extends Error {
-  constructor(message = 'AI interview generation is temporarily unavailable. Please retry.') {
+  // status lets callers distinguish "rate-limited, retry later" (429) from a
+  // generic outage (503) without re-parsing the message string.
+  constructor(message = 'AI interview generation is temporarily unavailable. Please retry.', status = 503) {
     super(message);
     this.name = 'AiUnavailableError';
+    this.status = status;
   }
 }
 

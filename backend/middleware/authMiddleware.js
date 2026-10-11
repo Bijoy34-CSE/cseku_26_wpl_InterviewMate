@@ -26,6 +26,18 @@ const protect = async (req, res, next) => {
     if (!user) {
       return res.status(401).json({ message: 'Not authorized, user no longer exists' });
     }
+    if (!user.isActive) {
+      return res.status(403).json({ message: 'This account has been disabled. Contact support for assistance.' });
+    }
+
+    const adminEmails = (process.env.ADMIN_EMAILS || '')
+      .split(',')
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean);
+    if (adminEmails.includes(String(user.email || '').toLowerCase()) && user.role !== 'admin') {
+      await User.updateOne({ _id: user._id, role: { $ne: 'admin' } }, { $set: { role: 'admin' } });
+      user.role = 'admin';
+    }
 
     req.user = user;
     next();

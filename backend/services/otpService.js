@@ -34,19 +34,24 @@ async function hashOtp(otp) {
  * Stamps a fresh OTP onto the user document (does not save).
  * @returns {Promise<string>} the plaintext OTP, for emailing only
  */
-async function issueOtp(user) {
+async function issueOtp(user, purpose = 'otp') {
+  const hashField = purpose === 'otp' ? 'otpHash' : `${purpose}OtpHash`;
+  const expiresField = purpose === 'otp' ? 'otpExpiresAt' : `${purpose}OtpExpiresAt`;
+  const attemptsField = purpose === 'otp' ? 'otpAttempts' : `${purpose}OtpAttempts`;
+  const sentAtField = purpose === 'otp' ? 'otpLastSentAt' : `${purpose}OtpLastSentAt`;
   const otp = generateOtp();
-  user.otpHash = await hashOtp(otp);
-  user.otpExpiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
-  user.otpAttempts = 0;
-  user.otpLastSentAt = new Date();
+  user[hashField] = await hashOtp(otp);
+  user[expiresField] = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
+  user[attemptsField] = 0;
+  user[sentAtField] = new Date();
   return otp;
 }
 
 /** Seconds a caller must still wait before another resend is allowed (0 = ok). */
-function resendCooldownRemaining(user) {
-  if (!user.otpLastSentAt) return 0;
-  const elapsed = (Date.now() - new Date(user.otpLastSentAt).getTime()) / 1000;
+function resendCooldownRemaining(user, purpose = 'otp') {
+  const sentAtField = purpose === 'otp' ? 'otpLastSentAt' : `${purpose}OtpLastSentAt`;
+  if (!user[sentAtField]) return 0;
+  const elapsed = (Date.now() - new Date(user[sentAtField]).getTime()) / 1000;
   return Math.max(0, Math.ceil(RESEND_COOLDOWN_SECONDS - elapsed));
 }
 
@@ -55,28 +60,32 @@ function resendCooldownRemaining(user) {
  * Mutates attempt counters / clears the OTP on success (does not save).
  * @returns {Promise<{ok: boolean, reason?: string}>}
  */
-async function verifyOtp(user, submittedOtp) {
-  if (!user.otpHash || !user.otpExpiresAt) {
+async function verifyOtp(user, submittedOtp, purpose = 'otp', { consume = true } = {}) {
+  const hashField = purpose === 'otp' ? 'otpHash' : `${purpose}OtpHash`;
+  const expiresField = purpose === 'otp' ? 'otpExpiresAt' : `${purpose}OtpExpiresAt`;
+  const attemptsField = purpose === 'otp' ? 'otpAttempts' : `${purpose}OtpAttempts`;
+  if (!user[hashField] || !user[expiresField]) {
     return { ok: false, reason: 'No verification code is pending. Please request a new one.' };
   }
 
-  if (new Date() > new Date(user.otpExpiresAt)) {
-    user.otpHash = null;
-    user.otpExpiresAt = null;
-    user.otpAttempts = 0;
+  if (new Date() > new Date(user[expiresField])) {
+    user[hashField] = null;
+    user[expiresField] = null;
+    user[attemptsField] = 0;
     return { ok: false, reason: 'This verification code has expired. Please request a new one.' };
   }
 
-  if (user.otpAttempts >= MAX_ATTEMPTS) {
-    user.otpHash = null;
-    user.otpExpiresAt = null;
+  if (user[attemptsField] >= MAX_ATTEMPTS) {
+    user[hashField] = null;
+    user[expiresField] = null;
+    user[attemptsField] = 0;
     return { ok: false, reason: 'Too many incorrect attempts. Please request a new code.' };
   }
 
-  const matches = await bcrypt.compare(String(submittedOtp).trim(), user.otpHash);
+  const matches = await bcrypt.compare(String(submittedOtp).trim(), user[hashField]);
   if (!matches) {
-    user.otpAttempts += 1;
-    const left = Math.max(0, MAX_ATTEMPTS - user.otpAttempts);
+    user[attemptsField] += 1;
+    const left = Math.max(0, MAX_ATTEMPTS - user[attemptsField]);
     return {
       ok: false,
       reason: left > 0
@@ -85,10 +94,12 @@ async function verifyOtp(user, submittedOtp) {
     };
   }
 
-  // Single use: burn the code on success.
-  user.otpHash = null;
-  user.otpExpiresAt = null;
-  user.otpAttempts = 0;
+  // Keep the code pending when a flow needs a separate confirmation step.
+  if (consume) {
+    user[hashField] = null;
+    user[expiresField] = null;
+  }
+  user[attemptsField] = 0;
   return { ok: true };
 }
 

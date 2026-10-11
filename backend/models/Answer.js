@@ -16,7 +16,14 @@ const answerSchema = new mongoose.Schema(
       speechRate: { type: Number, default: null }, // words per minute
       fillerWordRate: { type: Number, default: null }, // 0-1, share of words that were filler words
       fillerWordCount: { type: Number, default: null },
+      pauseCount: { type: Number, default: null }, // measured client-side from microphone level
+      longestPauseSeconds: { type: Number, default: null },
+      silenceRatio: { type: Number, default: null }, // 0-1 share of recording time that was silent
+      // Audio + Video only, and only when the browser can actually measure it.
+      faceVisibleRatio: { type: Number, default: null }, // 0-1, needs the browser FaceDetector API
+      movementScore: { type: Number, default: null }, // 0-100 frame-difference level
     },
+    inputMethod: { type: String, enum: ['typed', 'spoken'], default: 'typed' },
   },
   { timestamps: true }
 );

@@ -7,7 +7,10 @@ const interviewSessionSchema = new mongoose.Schema(
     // Configuration captured from the Start Interview wizard
     purpose: { type: String, required: true },
     type: { type: String, required: true },
+    purposeKey: { type: String }, // the selected purpose option (purpose may be a custom label)
+    initialDifficulty: { type: String },
     difficulty: { type: String, required: true }, // initial difficulty; the adaptive engine may move away from this as the session progresses
+    adaptiveDifficulty: { type: Boolean, default: true },
     level: { type: String },
     durationLabel: { type: String }, // e.g. "15 Mins" (kept for display parity with the existing UI)
     mode: { type: String },

@@ -7,6 +7,9 @@ const questionSchema = new mongoose.Schema(
     text: { type: String, required: true },
     category: { type: String, required: true }, // e.g. "Technical", "Behavioral", "System Design"
     difficulty: { type: String, required: true }, // Easy | Intermediate | Hard - set by the adaptive engine for this specific question
+    skippedAt: { type: Date, default: null }, // set when the candidate skipped this question without answering
+    missedAiFeedback: { type: String, default: '' },
+    missedSuggestedAnswer: { type: String, default: '' },
     source: { type: String, enum: ['ai', 'fallback'], required: true }, // which generator actually produced this question's text
   },
   { timestamps: true }

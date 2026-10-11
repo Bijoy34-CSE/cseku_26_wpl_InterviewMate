@@ -148,7 +148,7 @@ async function scoreAnswer({ questionText, answerText }) {
   const overlap = questionKeywords.filter((w) => answerLower.includes(w)).length;
   const relevanceScore = clamp(40 + overlap * 8);
 
-  // Filler-word heuristic feeds into confidence/communication.
+  // Filler-word heuristic feeds into observable delivery quality/communication.
   const fillerCount = FILLER_WORDS.reduce(
     (acc, fw) => acc + (answerLower.split(fw).length - 1),
     0
@@ -156,13 +156,13 @@ async function scoreAnswer({ questionText, answerText }) {
   const fillerPenalty = Math.min(fillerCount * 5, 30);
 
   const communication = clamp(lengthScore - fillerPenalty + (seed % 10));
-  const confidence = clamp(70 - fillerPenalty + (seed % 15));
+  const deliveryQuality = clamp(70 - fillerPenalty + (seed % 15));
   const technicalAccuracy = clamp((lengthScore + relevanceScore) / 2 + (seed % 8));
   const structuralFlow = clamp(50 + Math.min(wordCount, 80) * 0.3 - fillerPenalty / 2);
   const relevance = relevanceScore;
 
   const overall = Math.round(
-    (technicalAccuracy + structuralFlow + communication + confidence + relevance) / 5
+    (technicalAccuracy + structuralFlow + communication + deliveryQuality + relevance) / 5
   );
 
   const aiFeedback = wordCount < 15
@@ -177,7 +177,7 @@ async function scoreAnswer({ questionText, answerText }) {
     technicalAccuracy: Math.round(technicalAccuracy),
     structuralFlow: Math.round(structuralFlow),
     communication: Math.round(communication),
-    confidence: Math.round(confidence),
+    confidence: Math.round(deliveryQuality),
     relevance: Math.round(relevance),
     overall,
     strengths: [],
@@ -214,7 +214,7 @@ async function generateSessionFeedback({ scores }) {
   if (strengths.length === 0) strengths.push('Completed the full session without skipping questions');
 
   if (categoryScores.structuralFlow < 70) improvements.push('Answer structure could be improved - try definition, explanation, then example');
-  if (categoryScores.confidence < 70) improvements.push('Reduce filler words and pauses to sound more confident');
+  if (categoryScores.confidence < 70) improvements.push('Reduce filler words and pauses to improve observable delivery quality');
   if (categoryScores.answerRelevance < 70) improvements.push('Stay more directly focused on the specific concepts each question asks about');
   if (improvements.length === 0) improvements.push('Keep practicing under timed conditions to build additional speed and consistency');
 

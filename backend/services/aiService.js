@@ -1,86 +1,323 @@
 /**
- * AI service abstraction for Mock Interview.
+ * AI service abstraction for InterviewMate Mock Interview.
  *
- * IMPORTANT: this file backs Mock Interview ONLY, and Mock Interview uses
- * Gemini 2.5 Flash exclusively. It does NOT fall back to any other provider:
- *   - Not to Anthropic - anthropicProvider.js exists in the codebase but is
- *     deliberately not wired into REAL_PROVIDERS below, so Mock Interview
- *     can never select it (regardless of whether ANTHROPIC_API_KEY happens
- *     to be set). If a second real provider is ever wanted here, add it back
- *     explicitly.
- *   - Not to the heuristic fallbackProvider - that module is reserved for
- *     the separate Practice feature (a static, non-document-grounded
- *     question bank; see services/aiProviders/fallbackProvider.js). Practice
- *     does not currently call this service at all.
- * If Gemini fails (or isn't configured), this throws AiUnavailableError
- * rather than silently degrading to either of those.
+ * PRIMARY:
+ *   Gemini
  *
- * Every value returned from here carries `source: 'ai'` (added by the
- * provider itself), since a value from this service is never anything else.
+ * AUTOMATIC FALLBACK:
+ *   Ollama local model
+ *
+ * IMPORTANT:
+ * - Mock Interview never uses fallbackProvider.
+ * - Mock Interview never uses generic/static questions.
+ * - Gemini is always attempted first when configured.
+ * - Ollama is used automatically when Gemini is unavailable.
+ * - The same params/context are passed to both providers.
  */
 
-const fallbackProvider = require('./aiProviders/fallbackProvider'); // only used here for resolveCategoryBucket() - a deterministic label mapper, not question/score content
+const fallbackProvider = require('./aiProviders/fallbackProvider');
 const geminiProvider = require('./aiProviders/geminiProvider');
-const { InsufficientDocumentError, AiUnavailableError } = require('./aiErrors');
+const ollamaProvider = require('./aiProviders/ollamaProvider');
 
-// Gemini 2.5 Flash only - see the file header above for why Anthropic is
-// intentionally not included here.
-const REAL_PROVIDERS = [{ name: 'gemini', ...geminiProvider }];
+const policy = require('./interviewPolicy');
+
+const {
+  InsufficientDocumentError,
+  AiUnavailableError,
+} = require('./aiErrors');
 
 function getConfiguredProviders() {
-  return REAL_PROVIDERS.filter((provider) => provider.isConfigured());
+  const providers = [];
+
+  /*
+   * Gemini is ALWAYS first.
+   */
+  if (geminiProvider.isConfigured()) {
+    providers.push({
+      name: 'gemini',
+      provider: geminiProvider,
+    });
+  }
+
+  /*
+   * Ollama is ALWAYS second.
+   * It is the local automatic fallback.
+   */
+  if (ollamaProvider.isConfigured()) {
+    providers.push({
+      name: 'ollama',
+      provider: ollamaProvider,
+    });
+  }
+
+  return providers;
 }
 
-// True if any real AI provider is currently configured.
 function isRealAiConfigured() {
   return getConfiguredProviders().length > 0;
 }
 
-async function withRealProviderOnly(methodName, params) {
+function shouldFallbackToOllama(error) {
+  if (!error) return true;
+
+  /*
+   * This is a document-grounding failure, not a provider outage.
+   *
+   * Do not silently switch providers because doing so could hide the fact
+   * that the document does not contain enough usable information.
+   */
+  if (error instanceof InsufficientDocumentError) {
+    return false;
+  }
+
+  if (error.code === 'INSUFFICIENT_DOCUMENT') {
+    return false;
+  }
+
+  /*
+   * Provider/network/service errors should allow Ollama fallback.
+   */
+  return true;
+}
+
+async function runWithGeminiThenOllama(methodName, params) {
+  const providers = getConfiguredProviders();
+
+  if (providers.length === 0) {
+    throw new AiUnavailableError(
+      'No AI provider is configured. Configure Gemini or local Ollama.',
+      503
+    );
+  }
+
   let lastError = null;
 
-  for (const provider of getConfiguredProviders()) {
+  /*
+   * Explicit provider order:
+   *
+   * Gemini → Ollama
+   *
+   * Do not reorder this.
+   */
+  for (const entry of providers) {
+    const { name, provider } = entry;
+
     try {
-      return await provider[methodName](params);
+      console.log(`[aiService] Trying ${name}.${methodName}`);
+
+      const result = await provider[methodName](params);
+
+      /*
+       * Both providers return source: "ai".
+       * Keep the existing frontend/database contract unchanged.
+       */
+      console.log(`[aiService] ${name}.${methodName} succeeded`);
+
+      return result;
     } catch (error) {
-      // Never silently swap in the generic heuristic here - that would
-      // violate the "document is the exclusive knowledge source" rule for
-      // Mock Interview. A grounding failure is its own distinct, honest
-      // error and must propagate immediately.
+      lastError = error;
+
+      /*
+       * Never hide a grounding failure.
+       */
       if (error instanceof InsufficientDocumentError) {
         throw error;
       }
-      console.error(`[aiService] ${provider.name}.${methodName} failed, trying next provider:`, error.message);
-      lastError = error;
+
+      if (error.code === 'INSUFFICIENT_DOCUMENT') {
+        throw new InsufficientDocumentError(
+          'The uploaded document does not contain enough information to generate a valid document-grounded viva question. Try a more detailed document or adjust the interview settings.'
+        );
+      }
+
+      console.error(
+        `[aiService] ${name}.${methodName} failed:`,
+        error.message
+      );
+
+      /*
+       * If Gemini fails, continue to Ollama.
+       *
+       * This includes:
+       * - 429 quota/rate limit
+       * - 503 temporary unavailable
+       * - network errors
+       * - local/provider service errors
+       * - malformed provider response
+       *
+       * If this was already Ollama, the loop simply ends.
+       */
+      if (name === 'gemini' && shouldFallbackToOllama(error)) {
+        const ollamaConfigured = ollamaProvider.isConfigured();
+
+        if (ollamaConfigured) {
+          console.warn(
+            `[aiService] Gemini unavailable for ${methodName}. ` +
+              'Switching automatically to local Ollama.'
+          );
+
+          continue;
+        }
+      }
+
+      /*
+       * If Ollama failed, there is no third provider.
+       */
+      break;
     }
   }
 
-  // Every configured provider failed, or none was configured at all.
-  console.error(`[aiService] ${methodName} unavailable${lastError ? ': ' + lastError.message : ' (no AI provider configured)'}`);
-  throw new AiUnavailableError();
+  /*
+   * Preserve the existing 429 semantics when Gemini failed because of quota
+   * AND Ollama was unavailable/failed.
+   */
+  if (lastError?.status === 429) {
+    throw new AiUnavailableError(
+      'Gemini is rate-limited and the local AI fallback is unavailable. Please start Ollama and try again.',
+      429
+    );
+  }
+
+  throw new AiUnavailableError(
+    'AI evaluation is temporarily unavailable. Gemini could not respond and the local Ollama fallback is unavailable.',
+    503
+  );
 }
 
-// Maps a session's free-form `type` string to one of the fixed question
-// categories. Shared across providers so question generation and scoring
-// stay consistent for a given session.
 function resolveCategoryBucket(type) {
+  /*
+   * This helper is only a category mapper.
+   * It does NOT generate Mock Interview questions.
+   */
   return fallbackProvider.resolveCategoryBucket(type);
 }
 
 async function generateQuestion(params) {
-  return withRealProviderOnly('generateQuestion', params);
+  // Every setting and the adaptive plan reach BOTH providers through the same
+  // directives block, so a Gemini -> Ollama switch behaves identically.
+  return runWithGeminiThenOllama('generateQuestion', {
+    ...params,
+    directives: policy.questionDirectives({ ...params, purposeKey: params.purposeKey || params.purpose }),
+  });
+}
+
+function evaluationParams(params) {
+  const spoken = policy.isSpokenAnswer(params.mode, params.answerWasSpoken);
+  return {
+    spoken,
+    params: {
+      ...params,
+      spoken,
+      directives: policy.evaluationDirectives({
+        purpose: params.purpose,
+        level: params.level,
+        mode: params.mode,
+        spoken,
+        mediaMetrics: params.mediaMetrics,
+        standalonePractice: params.standalonePractice,
+      }),
+      standalonePractice: params.standalonePractice === true,
+    },
+  };
 }
 
 async function scoreAnswer(params) {
-  return withRealProviderOnly('scoreAnswer', params);
+  const { spoken, params: full } = evaluationParams(params);
+  const scored = await runWithGeminiThenOllama('scoreAnswer', full);
+  return policy.normalizeScore(scored, { spoken });
+}
+
+async function generateMissedAnswerGuidance(params) {
+  const scored = await scoreAnswer({
+    ...params,
+    answerText: '',
+    answerWasSpoken: false,
+    mode: 'Text Response',
+    unanswered: true,
+  });
+
+  if (!scored.aiFeedback.trim() || !scored.suggestedAnswer.trim()) {
+    throw new Error('AI provider returned empty guidance for an unanswered question');
+  }
+
+  return {
+    aiFeedback: scored.aiFeedback,
+    suggestedAnswer: scored.suggestedAnswer,
+  };
+}
+
+async function scoreStandalonePractice(params) {
+  const { spoken, params: full } = evaluationParams({
+    ...params,
+    standalonePractice: true,
+    answerWasSpoken: false,
+    mode: 'text',
+  });
+  const scored = await runWithGeminiThenOllama('scoreAnswer', full);
+  const result = policy.normalizeScore(scored, { spoken });
+  result.evidenceFromDocument = [];
+  return result;
 }
 
 async function generateSessionFeedback(params) {
-  return withRealProviderOnly('generateSessionFeedback', params);
+  return runWithGeminiThenOllama('generateSessionFeedback', params);
+}
+
+/**
+ * Practice Again deliberately uses Gemini only.
+ *
+ * Ollama is an automatic fallback for the live Mock Interview pipeline, but
+ * Practice Again must not silently switch providers because it is a separate
+ * re-attempt flow whose result is compared against the original answer.
+ */
+async function scorePracticeAnswer(params) {
+  if (!geminiProvider.isConfigured()) {
+    throw new AiUnavailableError(
+      'Gemini is required for Practice Again. Configure GEMINI_API_KEY and try again.',
+      503
+    );
+  }
+
+  try {
+    const { spoken, params: full } = evaluationParams(params);
+    return policy.normalizeScore(await geminiProvider.scoreAnswer(full), { spoken });
+  } catch (error) {
+    if (error instanceof InsufficientDocumentError || error?.code === 'INSUFFICIENT_DOCUMENT') {
+      throw error instanceof InsufficientDocumentError
+        ? error
+        : new InsufficientDocumentError(error.message);
+    }
+
+    if (error instanceof AiUnavailableError) {
+      throw error;
+    }
+
+    const status = Number(error?.status);
+    if (status === 429) {
+      throw new AiUnavailableError(
+        'Gemini is temporarily rate-limited. Practice Again cannot use the Ollama fallback; please try again later.',
+        429
+      );
+    }
+
+    throw new AiUnavailableError(
+      'Gemini could not evaluate this Practice Again response. Please try again.',
+      503
+    );
+  }
+}
+
+async function generateSessionFeedback(params) {
+  return runWithGeminiThenOllama(
+    'generateSessionFeedback',
+    params
+  );
 }
 
 function getConfiguredProviderNames() {
-  return getConfiguredProviders().map((provider) => provider.name);
+  return getConfiguredProviders().map(
+    (entry) => entry.name
+  );
 }
 
 module.exports = {
@@ -89,5 +326,8 @@ module.exports = {
   resolveCategoryBucket,
   generateQuestion,
   scoreAnswer,
+  generateMissedAnswerGuidance,
+  scoreStandalonePractice,
+  scorePracticeAnswer,
   generateSessionFeedback,
 };

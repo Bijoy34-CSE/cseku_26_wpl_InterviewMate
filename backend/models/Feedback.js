@@ -30,6 +30,13 @@ const feedbackSchema = new mongoose.Schema(
     },
     overallPercentage: { type: Number, required: true }, // == overallScore, kept alongside weightedScores for clarity
 
+    // Completion accounting - unanswered questions are never treated as answered.
+    totalQuestions: { type: Number, default: null },
+    answeredQuestions: { type: Number, default: null },
+    missedQuestions: { type: Number, default: 0 },
+    answeredAverage: { type: Number, default: null }, // average over answered questions only
+    timedOut: { type: Boolean, default: false },
+
     assessment: { type: String, required: true }, // the "Dr. Ava's Assessment" paragraph
     strengths: [{ type: String }],
     improvements: [{ type: String }],

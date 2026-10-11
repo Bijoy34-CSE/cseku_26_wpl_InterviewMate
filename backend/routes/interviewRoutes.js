@@ -6,10 +6,15 @@ const {
   createSession,
   getSession,
   listSessions,
+  deleteSession,
   submitAnswer,
+  skipQuestion,
   completeSession,
   timeoutSession,
+  practiceAgain,
+  listPracticeAttempts,
 } = require('../controllers/interviewController');
+const { evaluateAnswer } = require('../controllers/practiceController');
 
 // Uploaded resume/syllabus files are parsed in-memory (never written to
 // disk) and only their extracted text is kept - see services/documentService.js
@@ -32,11 +37,16 @@ function handleUploadError(err, req, res, next) {
 // All interview routes require a logged-in user
 router.use(protect);
 
+router.post('/practice/evaluate', evaluateAnswer);
 router.post('/sessions', upload.single('file'), handleUploadError, createSession);
 router.get('/sessions', listSessions);
+router.delete('/sessions/:id', deleteSession);
 router.get('/sessions/:id', getSession);
 router.post('/sessions/:id/answers', submitAnswer);
+router.post('/sessions/:id/skip', skipQuestion);
 router.post('/sessions/:id/complete', completeSession);
 router.post('/sessions/:id/timeout', timeoutSession);
+router.post('/sessions/:id/questions/:questionId/practice-again', practiceAgain);
+router.get('/sessions/:id/questions/:questionId/practice-attempts', listPracticeAttempts);
 
 module.exports = router;

@@ -55,14 +55,13 @@ function parseJsonResponse(rawText) {
   return JSON.parse(cleaned);
 }
 
-async function generateQuestion({ category, difficulty, purpose, type, askedTexts = [] }) {
+async function generateQuestion({ category, difficulty, purpose, askedTexts = [] }) {
   const systemPrompt =
     'You are an expert technical and behavioral interviewer generating one interview question at a time. ' +
     'Respond with ONLY a JSON object of the form {"text": "..."} - no markdown, no explanation, no code fences.';
 
   const userPrompt = [
     `Interview purpose: ${purpose}`,
-    `Interview type: ${type}`,
     `Question category to draw from: ${category}`,
     `Target difficulty: ${difficulty}`,
     askedTexts.length > 0
@@ -82,8 +81,9 @@ async function generateQuestion({ category, difficulty, purpose, type, askedText
 async function scoreAnswer({ questionText, answerText, category, difficulty }) {
   const systemPrompt =
     'You are an expert interview evaluator. Score the candidate\'s answer honestly and constructively. ' +
+    'Delivery quality means only observable answer-delivery characteristics; never infer anxiety, honesty, intelligence, personality, mental state, or psychological confidence. ' +
     'Respond with ONLY a JSON object with this exact shape (all scores are integers 0-100): ' +
-    '{"technicalAccuracy":0,"structuralFlow":0,"communication":0,"confidence":0,"relevance":0,' +
+    '{"technicalAccuracy":0,"structuralFlow":0,"communication":0,"deliveryQuality":0,"relevance":0,' +
     '"strengths":["..."],"weaknesses":["..."],"missingPoints":["..."],"aiFeedback":"...","suggestedAnswer":"..."} ' +
     'No markdown, no explanation outside the JSON.';
 
@@ -98,7 +98,7 @@ async function scoreAnswer({ questionText, answerText, category, difficulty }) {
   const raw = await callClaude(systemPrompt, userPrompt, 800);
   const parsed = parseJsonResponse(raw);
 
-  const requiredNumberFields = ['technicalAccuracy', 'structuralFlow', 'communication', 'confidence', 'relevance'];
+  const requiredNumberFields = ['technicalAccuracy', 'structuralFlow', 'communication', 'deliveryQuality', 'relevance'];
   for (const field of requiredNumberFields) {
     if (typeof parsed[field] !== 'number') {
       throw new Error(`Anthropic score response missing numeric field "${field}"`);
@@ -111,14 +111,14 @@ async function scoreAnswer({ questionText, answerText, category, difficulty }) {
   const asStringArray = (val) => (Array.isArray(val) ? val.filter((v) => typeof v === 'string') : []);
   const clamp = (n) => Math.max(0, Math.min(100, Math.round(n)));
   const overall = Math.round(
-    (parsed.technicalAccuracy + parsed.structuralFlow + parsed.communication + parsed.confidence + parsed.relevance) / 5
+    (parsed.technicalAccuracy + parsed.structuralFlow + parsed.communication + parsed.deliveryQuality + parsed.relevance) / 5
   );
 
   return {
     technicalAccuracy: clamp(parsed.technicalAccuracy),
     structuralFlow: clamp(parsed.structuralFlow),
     communication: clamp(parsed.communication),
-    confidence: clamp(parsed.confidence),
+    confidence: clamp(parsed.deliveryQuality),
     relevance: clamp(parsed.relevance),
     overall: clamp(overall),
     strengths: asStringArray(parsed.strengths),
@@ -130,7 +130,7 @@ async function scoreAnswer({ questionText, answerText, category, difficulty }) {
   };
 }
 
-async function generateSessionFeedback({ scores, purpose, type }) {
+async function generateSessionFeedback({ scores, purpose }) {
   const systemPrompt =
     'You are an expert interview coach summarizing a completed mock interview session. ' +
     'Respond with ONLY a JSON object of this exact shape: ' +
@@ -138,12 +138,11 @@ async function generateSessionFeedback({ scores, purpose, type }) {
     'No markdown, no explanation outside the JSON. Keep the assessment to 2-3 sentences, and provide 2-4 short strengths and improvements.';
 
   const scoreSummary = scores
-    .map((s, i) => `Q${i + 1}: overall ${s.overall}, technicalAccuracy ${s.technicalAccuracy}, structuralFlow ${s.structuralFlow}, communication ${s.communication}, confidence ${s.confidence}, relevance ${s.relevance}`)
+    .map((s, i) => `Q${i + 1}: overall ${s.overall}, technicalAccuracy ${s.technicalAccuracy}, structuralFlow ${s.structuralFlow}, communication ${s.communication}, deliveryQuality ${s.confidence}, relevance ${s.relevance}`)
     .join('\n');
 
   const userPrompt = [
     `Interview purpose: ${purpose}`,
-    `Interview type: ${type}`,
     'Per-question scores:',
     scoreSummary,
     'Write an overall assessment paragraph plus lists of strengths and areas to improve.',
@@ -170,7 +169,7 @@ async function generateSessionFeedback({ scores, purpose, type }) {
 
   const knowledge = avg('technicalAccuracy');
   const communicationScore = avg('communication');
-  const behavioral = avg('confidence');
+  const behavioral = avg('confidence'); // observable delivery quality, not psychological confidence
   const interviewPerformance = Math.round((avg('relevance') + avg('structuralFlow')) / 2);
   const weightedScores = { knowledge, communication: communicationScore, behavioral, interviewPerformance };
   const overallPercentage = Math.round(knowledge * 0.4 + communicationScore * 0.2 + behavioral * 0.2 + interviewPerformance * 0.2);

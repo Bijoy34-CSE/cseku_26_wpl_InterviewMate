@@ -1,6 +1,5 @@
 const mongoose = require('mongoose');
 const InterviewSession = require('../models/InterviewSession');
-const Feedback = require('../models/Feedback');
 const { serializeSession, serializeFeedback, buildBreakdown, finalizeSession } = require('../services/sessionService');
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
@@ -25,13 +24,8 @@ exports.getFeedbackForSession = async (req, res) => {
       return res.status(400).json({ message: 'This interview session is not finished yet' });
     }
 
-    let feedback = await Feedback.findOne({ session: session._id });
-    if (!feedback) {
-      // Defensive fallback: a completed session should always have feedback
-      // (submitAnswer/completeSession both create it), but regenerate it if
-      // it's somehow missing rather than erroring out.
-      feedback = await finalizeSession(session);
-    }
+    // Also retries any missing AI coaching saved for unanswered questions.
+    const feedback = await finalizeSession(session);
 
     const breakdown = await buildBreakdown(session._id);
 

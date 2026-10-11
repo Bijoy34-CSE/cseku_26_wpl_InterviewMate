@@ -1,21 +1,21 @@
 /**
  * Lightweight media-analysis layer for Audio / Audio+Video mode answers.
  *
- * Per the product requirement: Gemini isn't expected to calculate raw
- * audio/video metrics itself, and this app must never invent a signal it
- * can't actually measure. Today the only real, observable inputs available
- * are the spoken-answer transcript (from the browser's Web Speech API) and
- * how long the candidate had the microphone open (measured client-side).
- * From those two, exactly two signals are genuinely derivable:
+ * This app never invents a signal it cannot measure. Real, observable inputs:
  *
- *   - speechRate: words per minute
- *   - fillerWordRate / fillerWordCount: share of words that were filler words
+ *  Server-derived from the transcript + measured mic-open time:
+ *   - speechRate (words per minute)
+ *   - fillerWordRate / fillerWordCount
  *
- * True audio-level signals (pause ratio, interruptions) and any video signal
- * (camera-away ratio, posture, movement) would require real audio waveform
- * analysis or computer vision that this app does not implement - those are
- * deliberately left out entirely rather than estimated, so a consumer of
- * this data never mistakes an absent field for "measured and zero".
+ *  Measured in the browser and sent with the answer (validated + clamped here):
+ *   - pauseCount / longestPauseSeconds / silenceRatio  (microphone level)
+ *   - movementScore                                    (video frame difference)
+ *   - faceVisibleRatio                                 (only if the browser
+ *                                                       supports FaceDetector)
+ *
+ * Anything that was not measured stays null so a consumer never mistakes an
+ * absent field for "measured and zero". No emotional or psychological signal
+ * is derived from any of this.
  */
 
 const FILLER_WORDS = [
@@ -34,12 +34,19 @@ function countFillerWords(text) {
   return count;
 }
 
+const num = (v, min, max, digits = 2) => {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+  const clamped = Math.max(min, Math.min(max, v));
+  const f = 10 ** digits;
+  return Math.round(clamped * f) / f;
+};
+
 /**
- * @param {string} transcript - the candidate's transcribed spoken answer
- * @param {number|null|undefined} durationSeconds - measured mic-open duration, if available
- * @returns {{speechRate: number|null, fillerWordRate: number|null, fillerWordCount: number|null}}
+ * @param {string} transcript
+ * @param {number|null|undefined} durationSeconds measured mic-open duration
+ * @param {object} [clientSignals] browser-measured signals (untrusted input)
  */
-function analyzeSpokenAnswer(transcript, durationSeconds) {
+function analyzeSpokenAnswer(transcript, durationSeconds, clientSignals = {}) {
   const trimmed = (transcript || '').trim();
   const words = trimmed ? trimmed.split(/\s+/) : [];
   const wordCount = words.length;
@@ -47,10 +54,33 @@ function analyzeSpokenAnswer(transcript, durationSeconds) {
   const fillerWordCount = wordCount > 0 ? countFillerWords(trimmed) : null;
   const fillerWordRate = wordCount > 0 ? Math.round((fillerWordCount / wordCount) * 100) / 100 : null;
 
-  const hasReliableDuration = typeof durationSeconds === 'number' && durationSeconds >= 3; // too short to be a meaningful rate
+  const hasReliableDuration = typeof durationSeconds === 'number' && durationSeconds >= 3;
   const speechRate = hasReliableDuration && wordCount > 0 ? Math.round(wordCount / (durationSeconds / 60)) : null;
 
-  return { speechRate, fillerWordRate, fillerWordCount };
+  const c = clientSignals && typeof clientSignals === 'object' ? clientSignals : {};
+  const canTrustSignals = hasReliableDuration;
+
+  return {
+    speechRate,
+    fillerWordRate,
+    fillerWordCount,
+    pauseCount: canTrustSignals ? num(c.pauseCount, 0, 200, 0) : null,
+    longestPauseSeconds: canTrustSignals ? num(c.longestPauseSeconds, 0, 600, 1) : null,
+    silenceRatio: canTrustSignals ? num(c.silenceRatio, 0, 1, 2) : null,
+    faceVisibleRatio: canTrustSignals ? num(c.faceVisibleRatio, 0, 1, 2) : null,
+    movementScore: canTrustSignals ? num(c.movementScore, 0, 100, 0) : null,
+  };
 }
 
-module.exports = { analyzeSpokenAnswer };
+const EMPTY_METRICS = {
+  speechRate: null,
+  fillerWordRate: null,
+  fillerWordCount: null,
+  pauseCount: null,
+  longestPauseSeconds: null,
+  silenceRatio: null,
+  faceVisibleRatio: null,
+  movementScore: null,
+};
+
+module.exports = { analyzeSpokenAnswer, EMPTY_METRICS };

@@ -9,23 +9,31 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // Permissive international format: optional +, 7-15 digits, spaces/dashes ok.
 const MOBILE_REGEX = /^\+?[\d\s-]{7,20}$/;
 
-const generateToken = (userId) => jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '7d' });
+const generateToken = (userId, rememberMe = true) =>
+  jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: rememberMe ? '30d' : '7d' });
 
 const publicUser = (user) => ({
   id: user._id,
   name: user.name,
-  firstName: user.firstName,
-  middleName: user.middleName,
-  lastName: user.lastName,
   email: user.email,
   mobile: user.mobile,
   university: user.university,
+  profile: user.profile,
   isVerified: user.isVerified,
   provider: user.provider,
   avatarUrl: user.avatarUrl,
+  passwordLastChanged: user.passwordLastChanged,
+  preferences: user.preferences,
+  pendingEmail: user.pendingEmail,
+  role: user.role,
+  isActive: user.isActive,
+  lastLoginAt: user.lastLoginAt,
+  subscriptionExpiresAt: user.subscriptionExpiresAt,
+  freeSessionsUsed: user.freeSessionsUsed,
+  freeUsageMonth: user.freeUsageMonth,
 });
 
-const FRONTEND_URL = () => process.env.FRONTEND_URL || 'http://localhost:5173';
+const FRONTEND_URL = () => (process.env.FRONTEND_URL || 'http://localhost:5173').trim().replace(/\/+$/, '');
 
 // ---------------------------------------------------------------------------
 // Signup (step 1): create an unverified user and email them an OTP
@@ -34,6 +42,7 @@ exports.register = async (req, res) => {
   try {
     let { firstName, middleName, lastName, name, email, mobile, university, password, confirmPassword } = req.body;
 
+    name = String(name || '').trim();
     firstName = String(firstName || '').trim();
     middleName = String(middleName || '').trim();
     lastName = String(lastName || '').trim();
@@ -41,17 +50,10 @@ exports.register = async (req, res) => {
     mobile = String(mobile || '').trim();
     university = String(university || '').trim();
 
-    // `name` is still accepted so older clients keep working; if only a single
-    // name was sent, split it into parts.
-    if (!firstName && name) {
-      const parts = String(name).trim().split(/\s+/).filter(Boolean);
-      firstName = parts[0] || '';
-      lastName = parts.length > 1 ? parts[parts.length - 1] : '';
-      middleName = parts.length > 2 ? parts.slice(1, -1).join(' ') : '';
-    }
-
-    if (!firstName) return res.status(400).json({ message: 'First name is required', field: 'firstName' });
-    if (!lastName) return res.status(400).json({ message: 'Last name is required', field: 'lastName' });
+    // Older clients may still submit separate name fields.
+    const fullName = name || User.buildFullName(firstName, middleName, lastName);
+    if (!fullName) return res.status(400).json({ message: 'Name is required', field: 'name' });
+    if (fullName.length > 120) return res.status(400).json({ message: 'Name must be 120 characters or fewer', field: 'name' });
     if (!email) return res.status(400).json({ message: 'Email is required', field: 'email' });
     if (!EMAIL_REGEX.test(email)) {
       return res.status(400).json({ message: 'Please provide a valid email address', field: 'email' });
@@ -95,13 +97,11 @@ exports.register = async (req, res) => {
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    const fullName = User.buildFullName(firstName, middleName, lastName);
-
     const user = existingUser || new User({ email });
     user.name = fullName;
-    user.firstName = firstName;
-    user.middleName = middleName;
-    user.lastName = lastName;
+    user.firstName = name ? '' : firstName;
+    user.middleName = name ? '' : middleName;
+    user.lastName = name ? '' : lastName;
     user.mobile = mobile;
     user.university = university;
     user.password = hashedPassword;
@@ -204,6 +204,104 @@ exports.resendOtp = async (req, res) => {
   }
 };
 
+exports.requestPasswordReset = async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+      return res.status(400).json({ message: 'Enter a valid email address' });
+    }
+    if (!emailService.isConfigured()) {
+      return res.status(503).json({
+        message: `Email delivery is not configured on the server. Missing: ${emailService.missingVars().join(', ')}.`,
+      });
+    }
+
+    const user = await User.findOne({ email });
+    if (user?.isVerified && user.provider === 'local' && user.password) {
+      const cooldown = otpService.resendCooldownRemaining(user, 'passwordReset');
+      if (cooldown === 0) {
+        const otp = await otpService.issueOtp(user, 'passwordReset');
+        try {
+          await emailService.sendPasswordResetEmail(user.email, otp, otpService.OTP_TTL_MINUTES);
+        } catch (mailError) {
+          console.error('[auth] password reset email failed:', mailError.message);
+          return res.status(502).json({ message: 'We could not send the reset code. Please try again shortly.' });
+        }
+        await user.save();
+      }
+    }
+
+    return res.status(200).json({
+      message: 'If an eligible account exists for that email, a password reset code has been sent.',
+    });
+  } catch (error) {
+    console.error('[auth] password reset request failed:', error.message);
+    return res.status(500).json({ message: 'Could not request a password reset. Please try again.' });
+  }
+};
+
+exports.verifyPasswordResetCode = async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const otp = String(req.body.otp || '').trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || !/^\d{6}$/.test(otp)) {
+      return res.status(400).json({ message: 'Enter a valid email and 6-digit reset code' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user || !user.isVerified || user.provider !== 'local' || !user.password) {
+      return res.status(400).json({ message: 'Invalid or expired reset code. Request a new code and try again.' });
+    }
+
+    const result = await otpService.verifyOtp(user, otp, 'passwordReset', { consume: false });
+    await user.save();
+    if (!result.ok) return res.status(400).json({ message: result.reason });
+
+    return res.status(200).json({ message: 'Reset code verified. Choose a new password.' });
+  } catch (error) {
+    console.error('[auth] password reset code verification failed:', error.message);
+    return res.status(500).json({ message: 'Could not verify the reset code. Please try again.' });
+  }
+};
+
+exports.resetPassword = async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const otp = String(req.body.otp || '').trim();
+    const { password, confirmPassword } = req.body;
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || !otp) {
+      return res.status(400).json({ message: 'Enter a valid email and reset code' });
+    }
+    if (typeof password !== 'string' || password.length < 8 ||
+        !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters and contain a letter and a number' });
+    }
+    if (confirmPassword !== password) {
+      return res.status(400).json({ message: 'Passwords do not match' });
+    }
+
+    const user = await User.findOne({ email }).select('+password');
+    if (!user || !user.isVerified || user.provider !== 'local' || !user.password) {
+      return res.status(400).json({ message: 'Invalid or expired reset code. Request a new code and try again.' });
+    }
+
+    const result = await otpService.verifyOtp(user, otp, 'passwordReset');
+    if (!result.ok) {
+      await user.save();
+      return res.status(400).json({ message: result.reason });
+    }
+
+    user.password = await bcrypt.hash(password, 12);
+    user.passwordLastChanged = new Date();
+    await user.save();
+    return res.status(200).json({ message: 'Password reset successfully. You can now log in.' });
+  } catch (error) {
+    console.error('[auth] password reset failed:', error.message);
+    return res.status(500).json({ message: 'Could not reset the password. Please try again.' });
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Login
 // ---------------------------------------------------------------------------
@@ -211,6 +309,7 @@ exports.login = async (req, res) => {
   try {
     const email = String(req.body.email || '').trim().toLowerCase();
     const { password } = req.body;
+    const rememberMe = req.body.rememberMe !== false;
 
     if (!email || !password) return res.status(400).json({ message: 'Email and password are required' });
 
@@ -235,9 +334,12 @@ exports.login = async (req, res) => {
       });
     }
 
-    res.json({ token: generateToken(user._id), user: publicUser(user) });
+    user.lastLoginAt = new Date();
+    await user.save();
+    res.json({ token: generateToken(user._id, rememberMe), user: publicUser(user) });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('[auth] login failed:', error.message);
+    res.status(500).json({ message: 'Unable to sign in right now. Please try again.' });
   }
 };
 
@@ -273,6 +375,7 @@ exports.oauthStart = (provider) => (req, res) => {
     res.cookie(`oauth_state_${provider}`, state, {
       httpOnly: true,
       sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production',
       maxAge: 10 * 60 * 1000,
     });
 
@@ -326,6 +429,7 @@ exports.oauthCallback = (provider) => async (req, res) => {
       user.isVerified = true;
     }
 
+    user.lastLoginAt = new Date();
     await user.save();
 
     const token = generateToken(user._id);

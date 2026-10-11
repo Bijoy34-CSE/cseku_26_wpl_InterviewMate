@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "InterviewMate",
+    "slug": "interviewmate",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "interviewmate",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "icon": "./assets/images/icon.png"
+    },
+    "android": {
+      "package": "com.interviewmate.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#111A35",
+        "foregroundImage": "./assets/images/icon.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/icon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#F8F9FD",
+          "image": "./assets/images/icon.png",
+          "imageWidth": 96
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "ca737401-18d6-4284-9da4-5d356364aa4f"
+      }
+    }
+  }
+}
