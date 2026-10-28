@@ -28,15 +28,35 @@ function isConfigured() {
 // 429 (quota/rate limit) is NOT retried - hammering a rate-limited endpoint
 // only makes things worse, so it fails fast with a clear retry-later error
 // instead.
-const GEMINI_503_MAX_RETRIES = 2;
-const GEMINI_503_BACKOFF_MS = [300, 900]; // short exponential backoff
+const GEMINI_503_MAX_RETRIES = 4;
+const GEMINI_503_BACKOFF_MS = [1000, 2000, 4000, 8000]; // exponential backoff
+
+// If the primary model keeps returning 503 (overloaded) or is unavailable,
+// the same request is retried on this backup model. Set GEMINI_FALLBACK_MODEL
+// in the environment to a model that exists for your key.
+const DEFAULT_FALLBACK_MODEL = 'gemini-3.8-flash-lite';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function callGemini(systemPrompt, userPrompt, maxTokens = 1024, documentParts = []) {
-  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+  const primary = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+  const fallback = process.env.GEMINI_FALLBACK_MODEL || DEFAULT_FALLBACK_MODEL;
+
+  try {
+    return await callGeminiModel(primary, systemPrompt, userPrompt, maxTokens, documentParts);
+  } catch (error) {
+    const transient = error.status === 503 || error.status === 500 || error.status === 404;
+    if (transient && fallback && fallback !== primary) {
+      console.warn(`[gemini] ${primary} failed (${error.status}). Retrying on backup model ${fallback}.`);
+      return callGeminiModel(fallback, systemPrompt, userPrompt, maxTokens, documentParts);
+    }
+    throw error;
+  }
+}
+
+async function callGeminiModel(model, systemPrompt, userPrompt, maxTokens, documentParts) {
   const url = `${GEMINI_API_BASE}/models/${model}:generateContent`;
 
   const parts = [
@@ -97,7 +117,9 @@ async function callGemini(systemPrompt, userPrompt, maxTokens = 1024, documentPa
     }
 
     const errBody = await response.text().catch(() => '');
-    throw new Error(`Gemini API error (${response.status}): ${errBody.slice(0, 300)}`);
+    const err = new Error(`Gemini API error (${response.status}) on ${model}: ${errBody.slice(0, 300)}`);
+    err.status = response.status;
+    throw err;
   }
 
   const data = await response.json();
@@ -118,7 +140,32 @@ async function callGemini(systemPrompt, userPrompt, maxTokens = 1024, documentPa
 // Strips accidental markdown code fences and parses the model's JSON reply.
 function parseJsonResponse(rawText) {
   const cleaned = rawText.trim().replace(/^```json\s*|^```\s*|```$/g, '').trim();
-  return JSON.parse(cleaned);
+  try {
+    return JSON.parse(cleaned);
+  } catch (error) {
+    // Some models add extra text after the JSON. Take the first balanced {...} block.
+    const start = cleaned.indexOf('{');
+    if (start === -1) throw error;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < cleaned.length; i++) {
+      const ch = cleaned[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) return JSON.parse(cleaned.slice(start, i + 1));
+      }
+    }
+    throw error;
+  }
 }
 
 const MAX_GROUNDING_ATTEMPTS = 3;
